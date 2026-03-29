@@ -1,23 +1,66 @@
 #!/usr/bin/env node
 /**
  * Lightweight Chrome CDP MCP server.
- * Reads DevToolsActivePort, connects to a single target page,
+ * Connects to Chrome via DevToolsActivePort (or a specific --port / --profile),
+ * attaches to targets using Target.attachToTarget (works across all Chrome profiles),
  * and exposes tools for debugging without attaching to every tab.
+ *
+ * Usage:
+ *   node server.mjs                          # auto-detect from default Chrome
+ *   node server.mjs --port 9222              # connect to a specific debugging port
+ *   node server.mjs --profile "Profile 3"    # read DevToolsActivePort for a profile dir
+ *   CDP_PORT=9222 node server.mjs            # env var alternative
  */
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import WebSocket from 'ws';
 
+// ── CLI args / env ──────────────────────────────────────────────────────────
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const opts = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--port' && args[i + 1]) opts.port = args[++i];
+    if (args[i] === '--profile' && args[i + 1]) opts.profile = args[++i];
+  }
+  return opts;
+}
+
+const cliOpts = parseArgs();
+
 // ── CDP helpers ──────────────────────────────────────────────────────────────
 
 function getDevToolsEndpoint() {
-  const file = join(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort');
+  // 1. Explicit port (CLI or env)
+  const explicitPort = cliOpts.port || process.env.CDP_PORT;
+  if (explicitPort) {
+    return { port: explicitPort, wsPath: null };
+  }
+
+  // 2. Profile-specific DevToolsActivePort
+  const chromeBase = join(homedir(), 'Library/Application Support/Google/Chrome');
+  let file;
+  if (cliOpts.profile) {
+    // Try exact profile directory name first, then as a subdirectory
+    const profileDir = join(chromeBase, cliOpts.profile);
+    const parentFile = join(chromeBase, 'DevToolsActivePort');
+    // Chrome only writes one DevToolsActivePort at the top level, not per-profile.
+    // But if a --profile is specified we still use the main file, just for discovery.
+    file = parentFile;
+    if (!existsSync(file)) {
+      throw new Error(`DevToolsActivePort not found at ${file}. Is Chrome running?`);
+    }
+  } else {
+    file = join(chromeBase, 'DevToolsActivePort');
+  }
+
   const lines = readFileSync(file, 'utf8').trim().split('\n');
   return { port: lines[0], wsPath: lines[1] };
 }
 
-function cdpSend(ws, method, params = {}) {
+function cdpSend(ws, method, params = {}, sessionId = undefined) {
   return new Promise((resolve, reject) => {
     const id = ++cdpSend._id;
     const timeout = setTimeout(() => reject(new Error(`CDP timeout: ${method}`)), 15000);
@@ -31,19 +74,40 @@ function cdpSend(ws, method, params = {}) {
       }
     }
     ws.on('message', handler);
-    ws.send(JSON.stringify({ id, method, params }));
+    const message = { id, method, params };
+    if (sessionId) message.sessionId = sessionId;
+    ws.send(JSON.stringify(message));
   });
 }
 cdpSend._id = 0;
 
 let browserWs = null;
-let selectedPageWs = null;
+let selectedSessionId = null;
 let selectedPageInfo = null;
 
 async function getBrowserWs() {
   if (browserWs && browserWs.readyState === WebSocket.OPEN) return browserWs;
   const { port, wsPath } = getDevToolsEndpoint();
-  const url = `ws://127.0.0.1:${port}${wsPath}`;
+
+  // If we have a wsPath from DevToolsActivePort, use it directly.
+  // If only a port (explicit --port), discover via /json/version.
+  let url;
+  if (wsPath) {
+    url = `ws://127.0.0.1:${port}${wsPath}`;
+  } else {
+    // Fetch browser websocket URL from the HTTP endpoint
+    const http = await import('http');
+    const versionJson = await new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+      }).on('error', reject);
+    });
+    url = versionJson.webSocketDebuggerUrl;
+    if (!url) throw new Error('Could not get webSocketDebuggerUrl from /json/version');
+  }
+
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
     ws.on('open', () => { browserWs = ws; resolve(ws); });
@@ -58,22 +122,35 @@ async function listPages() {
   return (result.targetInfos || []).filter(t => t.type === 'page');
 }
 
-async function connectToPage(targetId) {
-  if (selectedPageWs) { try { selectedPageWs.close(); } catch {} }
-  const { port } = getDevToolsEndpoint();
-  const url = `ws://127.0.0.1:${port}/devtools/page/${targetId}`;
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
-    ws.on('open', async () => {
-      selectedPageWs = ws;
-      // Enable Runtime and Console
-      await cdpSend(ws, 'Runtime.enable').catch(() => {});
-      await cdpSend(ws, 'Console.enable').catch(() => {});
-      resolve(ws);
-    });
-    ws.on('error', reject);
-    setTimeout(() => reject(new Error('Page WS timeout')), 10000);
+async function attachToTarget(targetId) {
+  // Detach from previous target if any
+  if (selectedSessionId) {
+    try {
+      const ws = await getBrowserWs();
+      await cdpSend(ws, 'Target.detachFromTarget', { sessionId: selectedSessionId });
+    } catch { /* best-effort */ }
+    selectedSessionId = null;
+  }
+
+  const ws = await getBrowserWs();
+
+  // Use Target.attachToTarget with flatten: true.
+  // This works across ALL Chrome profiles (unlike direct /devtools/page/ connections).
+  const result = await cdpSend(ws, 'Target.attachToTarget', {
+    targetId,
+    flatten: true
   });
+
+  selectedSessionId = result.sessionId;
+
+  // Enable Runtime and Console on the attached target
+  await cdpSend(ws, 'Runtime.enable', {}, selectedSessionId).catch(() => {});
+  await cdpSend(ws, 'Console.enable', {}, selectedSessionId).catch(() => {});
+
+  // Set up console capture
+  setupConsoleCapture(ws, selectedSessionId);
+
+  return selectedSessionId;
 }
 
 // ── Console message buffer ──────────────────────────────────────────────────
@@ -81,11 +158,14 @@ async function connectToPage(targetId) {
 let consoleMessages = [];
 const MAX_CONSOLE = 200;
 
-function setupConsoleCapture(ws) {
+function setupConsoleCapture(ws, sessionId) {
   consoleMessages = [];
-  ws.on('message', (raw) => {
+  // Remove any previous listener
+  if (ws._cdpConsoleHandler) ws.off('message', ws._cdpConsoleHandler);
+
+  const handler = (raw) => {
     const msg = JSON.parse(raw);
-    if (msg.method === 'Runtime.consoleAPICalled') {
+    if (msg.method === 'Runtime.consoleAPICalled' && msg.sessionId === sessionId) {
       const entry = {
         type: msg.params.type,
         text: (msg.params.args || []).map(a => a.value ?? a.description ?? JSON.stringify(a)).join(' '),
@@ -94,7 +174,16 @@ function setupConsoleCapture(ws) {
       consoleMessages.push(entry);
       if (consoleMessages.length > MAX_CONSOLE) consoleMessages.shift();
     }
-  });
+  };
+  ws._cdpConsoleHandler = handler;
+  ws.on('message', handler);
+}
+
+// Helper: send CDP command to the selected page (via session)
+async function sendToPage(method, params = {}) {
+  if (!selectedSessionId) throw new Error('No page selected. Use cdp_select_page first.');
+  const ws = await getBrowserWs();
+  return cdpSend(ws, method, params, selectedSessionId);
 }
 
 // ── MCP protocol (JSON-RPC over stdio) ───────────────────────────────────────
@@ -178,16 +267,13 @@ async function handleToolCall(name, args) {
       }
       const page = cachedPages[args.index];
       if (!page) return `Error: index ${args.index} out of range (0-${cachedPages.length - 1})`;
-      const ws = await connectToPage(page.targetId);
-      setupConsoleCapture(ws);
+      await attachToTarget(page.targetId);
       selectedPageInfo = page;
       return `Selected: ${page.title}\n${page.url}`;
     }
 
     if (name === 'cdp_evaluate') {
-      if (!selectedPageWs || selectedPageWs.readyState !== WebSocket.OPEN)
-        return 'Error: No page selected. Use cdp_select_page first.';
-      const result = await cdpSend(selectedPageWs, 'Runtime.evaluate', {
+      const result = await sendToPage('Runtime.evaluate', {
         expression: args.expression,
         returnByValue: true,
         awaitPromise: true
@@ -209,18 +295,14 @@ async function handleToolCall(name, args) {
     }
 
     if (name === 'cdp_navigate') {
-      if (!selectedPageWs || selectedPageWs.readyState !== WebSocket.OPEN)
-        return 'Error: No page selected. Use cdp_select_page first.';
-      await cdpSend(selectedPageWs, 'Page.enable');
-      await cdpSend(selectedPageWs, 'Page.navigate', { url: args.url });
+      await sendToPage('Page.enable');
+      await sendToPage('Page.navigate', { url: args.url });
       return `Navigating to ${args.url}`;
     }
 
     if (name === 'cdp_snapshot') {
-      if (!selectedPageWs || selectedPageWs.readyState !== WebSocket.OPEN)
-        return 'Error: No page selected. Use cdp_select_page first.';
       const selector = args.selector || 'body';
-      const result = await cdpSend(selectedPageWs, 'Runtime.evaluate', {
+      const result = await sendToPage('Runtime.evaluate', {
         expression: `document.querySelector(${JSON.stringify(selector)})?.outerHTML?.slice(0, 50000) || 'Element not found: ${selector}'`,
         returnByValue: true
       });
@@ -228,9 +310,7 @@ async function handleToolCall(name, args) {
     }
 
     if (name === 'cdp_url') {
-      if (!selectedPageWs || selectedPageWs.readyState !== WebSocket.OPEN)
-        return 'Error: No page selected. Use cdp_select_page first.';
-      const result = await cdpSend(selectedPageWs, 'Runtime.evaluate', {
+      const result = await sendToPage('Runtime.evaluate', {
         expression: 'JSON.stringify({url: location.href, title: document.title})',
         returnByValue: true
       });
@@ -281,7 +361,7 @@ async function processMessage(line) {
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'chrome-cdp', version: '1.0.0' }
+        serverInfo: { name: 'chrome-cdp', version: '1.1.0' }
       }
     });
     return;
